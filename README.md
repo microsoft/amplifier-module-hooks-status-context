@@ -86,10 +86,10 @@ a1b2c3d docs: Update hooks documentation
 
 ## How It Works
 
-1. **Event Registration**: Hooks into `prompt:submit` event
+1. **Event Registration**: Hooks into `prompt:submit` event (once per turn)
 2. **Context Gathering**: Collects enabled status information (datetime, git)
-3. **Context Injection**: Returns `HookResult` with `action="inject_context"`
-4. **Agent Awareness**: Agent sees injected context in its conversation history
+3. **Context Injection**: Returns `HookResult` with `action="inject_context"` and `ephemeral=True`
+4. **Agent Awareness**: Agent sees injected context for current turn (not stored in conversation history)
 
 ## When to Use
 

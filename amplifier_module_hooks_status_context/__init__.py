@@ -103,6 +103,7 @@ class StatusContextHook:
                 action="inject_context",
                 context_injection=context_injection,
                 context_injection_role="user",  # User role more visible than system
+                ephemeral=True,  # Temporary injection, not stored in context (git status doesn't need persistence)
                 suppress_output=True,  # Don't show verbose status to user
             )
             return result
