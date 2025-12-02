@@ -23,6 +23,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Optional configuration
+            - working_dir: Working directory for operations (default: ".")
             - include_git: Enable git status injection (default: True)
             - git_include_status: Include working directory status (default: True)
             - git_include_commits: Number of recent commits (default: 5)
@@ -54,6 +55,9 @@ class StatusContextHook:
         Args:
             config: Configuration dict with options for git and datetime injection
         """
+        # Working directory
+        self.working_dir = config.get("working_dir", ".")
+
         # Git context options
         self.include_git = config.get("include_git", True)
         self.git_include_status = config.get("git_include_status", True)
@@ -112,8 +116,12 @@ class StatusContextHook:
     def _gather_env_info(self) -> dict[str, Any]:
         """Gather environment information (working dir, platform, OS, date, git detection)."""
         try:
-            # Get current working directory
-            working_dir = str(Path.cwd())
+            # Get working directory (from config or current directory)
+            working_dir_path = Path(self.working_dir)
+            if not working_dir_path.is_absolute():
+                working_dir = str(Path.cwd() / working_dir_path)
+            else:
+                working_dir = str(working_dir_path)
 
             # Detect if in git repo
             is_git_repo = self._run_git(["rev-parse", "--git-dir"]) is not None
@@ -158,9 +166,14 @@ class StatusContextHook:
 
         except Exception as e:
             logger.warning(f"Failed to gather environment info: {e}")
-            # Return minimal info on failure
+            # Return minimal info on failure with configured working_dir
+            working_dir_path = Path(self.working_dir)
+            if not working_dir_path.is_absolute():
+                fallback_dir = str(Path.cwd() / working_dir_path)
+            else:
+                fallback_dir = str(working_dir_path)
             return {
-                "working_dir": str(Path.cwd()),
+                "working_dir": fallback_dir,
                 "is_git_repo": False,
                 "platform": "unknown",
                 "os_version": "unknown",
@@ -211,12 +224,19 @@ class StatusContextHook:
     def _run_git(self, args: list[str], timeout: float = 1.0) -> str | None:
         """Run a git command and return output."""
         try:
+            # Resolve working directory (handle relative paths)
+            working_dir_path = Path(self.working_dir)
+            if not working_dir_path.is_absolute():
+                cwd = Path.cwd() / working_dir_path
+            else:
+                cwd = working_dir_path
+
             result = subprocess.run(
                 ["git"] + args,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=Path.cwd(),
+                cwd=cwd,
             )
             if result.returncode == 0:
                 return result.stdout.strip()
