@@ -3,6 +3,9 @@ Status context injection hook module.
 Injects current git status and datetime into agent context before each prompt.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "hook"
+
 import logging
 import platform
 import subprocess
