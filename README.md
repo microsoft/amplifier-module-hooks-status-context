@@ -1,6 +1,6 @@
 # amplifier-module-hooks-status-context
 
-Injects environment info (working directory, platform, OS, date) and optional git status into agent context before each prompt. Ensures agent has fresh contextual information for decisions.
+Injects environment info (working directory, platform, OS, date), session context, and optional git status into agent context before each prompt. Ensures agent has fresh contextual information for decisions.
 
 ## Usage
 
@@ -17,17 +17,20 @@ hooks:
       git_include_main_branch: true    # Detect main branch (default: true)
       include_datetime: true           # Show date/time (default: true)
       datetime_include_timezone: false # Include TZ name (default: false)
+      include_session: true            # Show session ID info (default: true)
 ```
 
 ## Output Format
 
-**In git repository:**
+**In git repository (root session):**
 
 ```
 <system-reminder>
 Here is useful information about the environment you are running in:
 <env>
 Working directory: /home/user/projects/myapp
+Session ID: session_abc123
+Is sub-session: No
 Is directory a git repo: Yes
 Platform: linux
 OS Version: Linux 6.6.87.2-microsoft-standard-WSL2
@@ -49,6 +52,25 @@ def5678 refactor: Simplify request handling
 </system-reminder>
 ```
 
+**In a sub-session (spawned by task tool):**
+
+```
+<system-reminder>
+Here is useful information about the environment you are running in:
+<env>
+Working directory: /home/user/projects/myapp
+Session ID: session_abc123-1234567890abcdef_zen-architect
+Parent Session ID: session_abc123
+Is sub-session: Yes
+Is directory a git repo: Yes
+Platform: linux
+OS Version: Linux 6.6.87.2-microsoft-standard-WSL2
+Today's date: 2025-11-09 14:23:45
+</env>
+...
+</system-reminder>
+```
+
 **Outside git repository:**
 
 ```
@@ -56,6 +78,8 @@ def5678 refactor: Simplify request handling
 Here is useful information about the environment you are running in:
 <env>
 Working directory: /home/user/documents
+Session ID: session_def456
+Is sub-session: No
 Is directory a git repo: No
 Platform: linux
 OS Version: Linux 6.6.87.2-microsoft-standard-WSL2
@@ -64,7 +88,7 @@ Today's date: 2025-11-09 14:23:45
 </system-reminder>
 ```
 
-Note: Git status only shown when in a git repository and `include_git: true`. Date format includes time when `include_datetime: true`, otherwise date only.
+Note: Git status only shown when in a git repository and `include_git: true`. Date format includes time when `include_datetime: true`, otherwise date only. Session lineage (parent session ID) only shown for sub-sessions spawned via the task tool.
 
 ## Contributing
 

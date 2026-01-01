@@ -34,13 +34,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - git_include_main_branch: Detect main branch (default: True)
             - include_datetime: Enable datetime injection (default: True)
             - datetime_include_timezone: Include timezone name (default: False)
+            - include_session: Enable session ID injection (default: True)
             - priority: Hook priority (default: 0)
 
     Returns:
         Optional cleanup function
     """
     config = config or {}
-    hook = StatusContextHook(config)
+    hook = StatusContextHook(coordinator, config)
     hook.register(coordinator.hooks)
     logger.info("Mounted hooks-status-context")
     return
@@ -48,16 +49,20 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 class StatusContextHook:
     """
-    Hook that injects status context (git, datetime) before each prompt.
+    Hook that injects status context (git, datetime, session) before each prompt.
     """
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, coordinator: ModuleCoordinator, config: dict[str, Any]):
         """
         Initialize the status context hook.
 
         Args:
-            config: Configuration dict with options for git and datetime injection
+            coordinator: Module coordinator for accessing session info
+            config: Configuration dict with options for git, datetime, and session injection
         """
+        # Store coordinator for session info access
+        self.coordinator = coordinator
+
         # Working directory
         self.working_dir = config.get("working_dir", ".")
 
@@ -71,6 +76,9 @@ class StatusContextHook:
         # Datetime options
         self.include_datetime = config.get("include_datetime", True)
         self.datetime_include_timezone = config.get("datetime_include_timezone", False)
+
+        # Session options
+        self.include_session = config.get("include_session", True)
 
         # Hook priority
         self.priority = config.get("priority", 0)
@@ -117,7 +125,7 @@ class StatusContextHook:
         )
 
     def _gather_env_info(self) -> dict[str, Any]:
-        """Gather environment information (working dir, platform, OS, date, git detection)."""
+        """Gather environment information (working dir, platform, OS, date, session, git detection)."""
         try:
             # Get working directory (from config or current directory)
             working_dir_path = Path(self.working_dir)
@@ -146,17 +154,43 @@ class StatusContextHook:
             else:
                 date_str = now.strftime("%Y-%m-%d")
 
+            # Get session info (from kernel via coordinator)
+            session_id = None
+            parent_session_id = None
+            is_sub_session = False
+            if self.include_session:
+                try:
+                    session_id = self.coordinator.session_id
+                    parent_session_id = self.coordinator.parent_id
+                    is_sub_session = parent_session_id is not None
+                except Exception as e:
+                    logger.debug(f"Could not get session info: {e}")
+
             # Format the env block
-            formatted = (
-                "Here is useful information about the environment you are running in:\n"
-                "<env>\n"
-                f"Working directory: {working_dir}\n"
-                f"Is directory a git repo: {'Yes' if is_git_repo else 'No'}\n"
-                f"Platform: {platform_name}\n"
-                f"OS Version: {os_version}\n"
-                f"Today's date: {date_str}\n"
-                "</env>"
-            )
+            env_lines = [
+                "Here is useful information about the environment you are running in:",
+                "<env>",
+                f"Working directory: {working_dir}",
+            ]
+
+            # Add session info if available
+            if self.include_session and session_id:
+                env_lines.append(f"Session ID: {session_id}")
+                if is_sub_session:
+                    env_lines.append(f"Parent Session ID: {parent_session_id}")
+                    env_lines.append("Is sub-session: Yes")
+                else:
+                    env_lines.append("Is sub-session: No")
+
+            env_lines.extend([
+                f"Is directory a git repo: {'Yes' if is_git_repo else 'No'}",
+                f"Platform: {platform_name}",
+                f"OS Version: {os_version}",
+                f"Today's date: {date_str}",
+                "</env>",
+            ])
+
+            formatted = "\n".join(env_lines)
 
             return {
                 "working_dir": working_dir,
@@ -164,6 +198,9 @@ class StatusContextHook:
                 "platform": platform_name,
                 "os_version": os_version,
                 "date": date_str,
+                "session_id": session_id,
+                "parent_session_id": parent_session_id,
+                "is_sub_session": is_sub_session,
                 "formatted": formatted,
             }
 
@@ -181,6 +218,9 @@ class StatusContextHook:
                 "platform": "unknown",
                 "os_version": "unknown",
                 "date": datetime.now().strftime("%Y-%m-%d"),
+                "session_id": None,
+                "parent_session_id": None,
+                "is_sub_session": False,
                 "formatted": "Here is useful information about the environment you are running in:\n<env>\nEnvironment information unavailable\n</env>",
             }
 
