@@ -19,6 +19,52 @@ from amplifier_core import ModuleCoordinator
 logger = logging.getLogger(__name__)
 
 
+# Tier 1: Always ignore (DoS prevention) - Even if tracked, these should never bloat context
+DEFAULT_TIER1_PATTERNS = [
+    "node_modules/**",
+    ".npm/**",
+    ".yarn/**",
+    ".pnpm-store/**",
+    ".venv/**",
+    "venv/**",
+    "env/**",
+    "ENV/**",
+    "__pycache__/**",
+    "*.pyc",
+    "*.pyo",
+    ".pytest_cache/**",
+    ".mypy_cache/**",
+    ".ruff_cache/**",
+    "build/**",
+    "dist/**",
+    "out/**",
+    "target/**",
+    "bin/**",
+    "obj/**",
+    ".git/**",
+]
+
+# Tier 2: Limit with context - Show some, summarize rest
+DEFAULT_TIER2_PATTERNS = [
+    "*.lock",
+    "*.sum",
+    "yarn.lock",
+    "package-lock.json",
+    "Gemfile.lock",
+    ".idea/**",
+    ".vscode/**",
+    "*.swp",
+    "*.swo",
+    "*.log",
+    "logs/**",
+    "coverage/**",
+    ".coverage",
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+]
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the status context hook.
@@ -34,7 +80,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - git_include_main_branch: Detect main branch (default: True)
             - git_status_include_untracked: Include untracked files (default: True)
             - git_status_max_untracked: Max untracked files to show (default: 20, 0=unlimited)
-            - git_status_max_lines: Hard limit on total status lines (default: None)
+            - git_status_max_lines: Hard limit on total status lines (default: 100)
+            - git_status_enable_path_filtering: Enable tier-based path filtering (default: True)
+            - git_status_tier1_patterns_extend: Additional Tier 1 patterns to ignore (default: [])
+            - git_status_tier2_patterns_extend: Additional Tier 2 patterns to limit (default: [])
+            - git_status_tier2_limit: Max Tier 2 files to show (default: 10)
+            - git_status_max_tracked: Max tracked files to show (default: 50)
+            - git_status_show_filter_summary: Show filtering messages (default: True)
             - include_datetime: Enable datetime injection (default: True)
             - datetime_include_timezone: Include timezone name (default: False)
             - include_session: Enable session ID injection (default: True)
@@ -81,7 +133,27 @@ class StatusContextHook:
             "git_status_include_untracked", True
         )
         self.git_status_max_untracked = config.get("git_status_max_untracked", 20)
-        self.git_status_max_lines = config.get("git_status_max_lines", None)
+        self.git_status_max_lines = config.get("git_status_max_lines", 100)
+
+        # Tier-based filtering (NEW - safe by default)
+        self.git_status_enable_path_filtering = config.get(
+            "git_status_enable_path_filtering", True
+        )
+        self.tier1_patterns = DEFAULT_TIER1_PATTERNS + config.get(
+            "git_status_tier1_patterns_extend", []
+        )
+        self.tier2_patterns = DEFAULT_TIER2_PATTERNS + config.get(
+            "git_status_tier2_patterns_extend", []
+        )
+        self.git_status_tier2_limit = config.get("git_status_tier2_limit", 10)
+
+        # Hard limits (NEW - safe by default)
+        self.git_status_max_tracked = config.get("git_status_max_tracked", 50)
+
+        # Filtering messages (NEW)
+        self.git_status_show_filter_summary = config.get(
+            "git_status_show_filter_summary", True
+        )
 
         # Datetime options
         self.include_datetime = config.get("include_datetime", True)
@@ -284,65 +356,166 @@ class StatusContextHook:
             logger.warning(f"Failed to gather git context: {e}")
             return None
 
-    def _gather_git_status(self) -> str | None:
-        """
-        Get git status with smart truncation.
+    def _matches_tier(self, filepath: str, patterns: list[str]) -> bool:
+        """Check if filepath matches any pattern in the list.
 
-        Separates tracked changes from untracked files and applies limits to prevent
-        token bloat from large numbers of untracked files (e.g., node_modules/).
+        Args:
+            filepath: File path to check
+            patterns: List of glob patterns to match against
 
         Returns:
-            Formatted git status output with truncation applied, or None if no changes
+            True if filepath matches any pattern
         """
-        # Get raw git status
+        import fnmatch
+
+        for pattern in patterns:
+            # Handle directory patterns (ends with /**)
+            if pattern.endswith("/**"):
+                prefix = pattern[:-3]  # Remove /**
+                if filepath.startswith(prefix):
+                    return True
+            # Handle glob patterns
+            elif fnmatch.fnmatch(filepath, pattern):
+                return True
+        return False
+
+    def _classify_status_line(self, line: str) -> tuple[str, str, str]:
+        """Classify git status line into tier.
+
+        Args:
+            line: Git status line in --short format (e.g., "M  file.py" or "?? dir/file.js")
+
+        Returns:
+            Tuple of (tier, filepath, status_code)
+            - tier: "tier1", "tier2", or "tier3"
+            - filepath: The file path from the status line
+            - status_code: The git status code (e.g., "M", "A", "??")
+        """
+        # Parse git status --short format: "XY filepath"
+        # Status codes are 2 characters, followed by space
+        status_code = line[:2].strip()
+        filepath = line[3:].strip() if len(line) > 3 else ""
+
+        if not self.git_status_enable_path_filtering:
+            return ("tier3", filepath, status_code)
+
+        # Check tier 1 (always ignore)
+        if self._matches_tier(filepath, self.tier1_patterns):
+            return ("tier1", filepath, status_code)
+
+        # Check tier 2 (limit with context)
+        if self._matches_tier(filepath, self.tier2_patterns):
+            return ("tier2", filepath, status_code)
+
+        # Everything else is tier 3 (show)
+        return ("tier3", filepath, status_code)
+
+    def _gather_git_status(self) -> str | None:
+        """
+        Get git status with tier-based path filtering.
+
+        Three-tier classification system:
+        - Tier 1 (Always Ignore): node_modules/, .venv/, build/, etc. - Even if tracked
+        - Tier 2 (Limit with Context): *.lock, .vscode/, *.log, etc. - Show some, summarize rest
+        - Tier 3 (Always Show): Source code and important files
+
+        Returns:
+            Formatted git status output with tier-based filtering applied
+        """
         raw_status = self._run_git(["status", "--short"])
         if not raw_status:
             return "Working directory clean"
 
-        # Parse lines and separate tracked from untracked
-        lines = raw_status.splitlines()
-        tracked_lines = []
-        untracked_lines = []
+        # Classify all lines into tiers
+        tier1_tracked = []
+        tier1_untracked = []
+        tier2_lines = []
+        tier3_tracked = []
+        tier3_untracked = []
 
-        for line in lines:
-            if line.startswith("??"):
-                untracked_lines.append(line)
-            else:
-                tracked_lines.append(line)
+        for line in raw_status.splitlines():
+            tier, filepath, status = self._classify_status_line(line)
 
-        # Apply hard limit first if configured (limits total output regardless of type)
-        if self.git_status_max_lines is not None and self.git_status_max_lines > 0:
-            total_lines = tracked_lines + untracked_lines
-            if len(total_lines) > self.git_status_max_lines:
-                omitted = len(total_lines) - self.git_status_max_lines
-                result_lines = total_lines[: self.git_status_max_lines]
-                result_lines.append(f"... ({omitted} more files omitted)")
-                return "\n".join(result_lines)
-            return "\n".join(total_lines)
+            if tier == "tier1":
+                if status == "??":
+                    tier1_untracked.append(line)
+                else:
+                    tier1_tracked.append(line)
+            elif tier == "tier2":
+                tier2_lines.append(line)
+            else:  # tier3
+                if status == "??":
+                    tier3_untracked.append(line)
+                else:
+                    tier3_tracked.append(line)
 
-        # Build output: always show all tracked changes
-        result_lines = tracked_lines.copy()
+        # Build output
+        result = []
 
-        # Handle untracked files based on configuration
-        if not self.git_status_include_untracked:
-            # Don't include untracked files at all
-            if untracked_lines:
-                result_lines.append(
-                    f"... ({len(untracked_lines)} untracked files omitted)"
-                )
-        elif self.git_status_max_untracked == 0:
-            # Unlimited untracked files (old behavior)
-            result_lines.extend(untracked_lines)
+        # Tier 3 tracked: Apply tracked limit
+        if len(tier3_tracked) <= self.git_status_max_tracked:
+            result.extend(tier3_tracked)
         else:
-            # Limit untracked files to max_untracked
-            if len(untracked_lines) <= self.git_status_max_untracked:
-                result_lines.extend(untracked_lines)
-            else:
-                result_lines.extend(untracked_lines[: self.git_status_max_untracked])
-                omitted = len(untracked_lines) - self.git_status_max_untracked
-                result_lines.append(f"... ({omitted} more untracked files omitted)")
+            result.extend(tier3_tracked[: self.git_status_max_tracked])
+            omitted = len(tier3_tracked) - self.git_status_max_tracked
+            if self.git_status_show_filter_summary:
+                result.append(f"... ({omitted} more tracked files omitted)")
 
-        return "\n".join(result_lines) if result_lines else "Working directory clean"
+        # Tier 3 untracked: Apply untracked limit (existing logic)
+        if self.git_status_include_untracked:
+            if len(tier3_untracked) <= self.git_status_max_untracked:
+                result.extend(tier3_untracked)
+            else:
+                result.extend(tier3_untracked[: self.git_status_max_untracked])
+                omitted = len(tier3_untracked) - self.git_status_max_untracked
+                if self.git_status_show_filter_summary:
+                    result.append(f"... ({omitted} more untracked files omitted)")
+
+        # Tier 2: Limited display
+        if len(tier2_lines) <= self.git_status_tier2_limit:
+            result.extend(tier2_lines)
+        else:
+            result.extend(tier2_lines[: self.git_status_tier2_limit])
+            omitted = len(tier2_lines) - self.git_status_tier2_limit
+            if self.git_status_show_filter_summary:
+                result.append(f"... ({omitted} more support files omitted)")
+
+        # Add blank line before summaries if we showed files
+        if (
+            result
+            and self.git_status_show_filter_summary
+            and (tier1_tracked or tier1_untracked)
+        ):
+            result.append("")
+
+        # Tier 1 summaries with explicit messages
+        if self.git_status_show_filter_summary:
+            if tier1_tracked:
+                # WARNING: Tracked files in ignored paths
+                result.append(
+                    f"[WARNING: {len(tier1_tracked)} tracked files in ignored paths]"
+                )
+                # Show examples
+                examples = tier1_tracked[:3]
+                for ex in examples:
+                    result.append(f"  {ex}")
+                if len(tier1_tracked) > 3:
+                    result.append(f"  ... and {len(tier1_tracked) - 3} more")
+                result.append("[Suggestion: These directories should not be tracked]")
+
+            if tier1_untracked:
+                result.append(
+                    f"[Filtered: {len(tier1_untracked)} untracked files in ignored paths]"
+                )
+
+        # Apply absolute hard limit (safety backstop)
+        if len(result) > self.git_status_max_lines:
+            result = result[: self.git_status_max_lines]
+            result.append(
+                f"[Hard limit reached: output truncated to {self.git_status_max_lines} lines]"
+            )
+
+        return "\n".join(result) if result else "Working directory clean"
 
     def _run_git(self, args: list[str], timeout: float = 1.0) -> str | None:
         """Run a git command and return output."""
