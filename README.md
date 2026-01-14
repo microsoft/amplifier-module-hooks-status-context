@@ -15,9 +15,62 @@ hooks:
       git_include_commits: 5           # Recent commits count (default: 5, 0=disable)
       git_include_branch: true         # Show current branch (default: true)
       git_include_main_branch: true    # Detect main branch (default: true)
+      git_status_include_untracked: true # Include untracked files (default: true)
+      git_status_max_untracked: 20       # Max untracked files (default: 20, 0=unlimited)
+      git_status_max_lines: null         # Hard limit on total lines (default: null)
       include_datetime: true           # Show date/time (default: true)
       datetime_include_timezone: false # Include TZ name (default: false)
       include_session: true            # Show session ID info (default: true)
+```
+
+## Token Safety
+
+**By default, git status output is automatically truncated to prevent excessive token consumption.**
+
+### Why This Matters
+
+Without proper `.gitignore` files, git status can enumerate thousands of files (node_modules/, .venv/, build artifacts), causing 200k+ tokens to be injected per request. This leads to:
+- Massive API costs ($3+ per conversation)
+- Slow response times (processing huge context)
+- Context window overflow
+
+### How It Works
+
+The module uses **smart truncation** that preserves valuable signal while limiting noise:
+
+- **Tracked changes** (M, A, D, R, C, U) are always shown in full (bounded, important)
+- **Untracked files** (??) are limited to first 20 by default (unbounded, noisy)
+- Clear truncation messages inform you when files are omitted
+
+### Configuration Examples
+
+**Default behavior (safe):**
+```yaml
+# No config needed - automatically limits untracked files to 20
+```
+
+**Disable untracked files entirely:**
+```yaml
+config:
+  git_status_include_untracked: false  # Only show tracked changes
+```
+
+**Show more untracked files:**
+```yaml
+config:
+  git_status_max_untracked: 50  # Show first 50 untracked files
+```
+
+**Restore unlimited behavior (use with caution):**
+```yaml
+config:
+  git_status_max_untracked: 0  # 0 = unlimited (old behavior)
+```
+
+**Add emergency hard limit:**
+```yaml
+config:
+  git_status_max_lines: 100  # Never exceed 100 lines total
 ```
 
 ## Output Format
@@ -44,7 +97,10 @@ Main branch (you will usually use this for PRs): main
 
 Status:
 M src/api.py
+A src/new_feature.py
 ?? tests/test_api.py
+?? debug.log
+... (1,847 more untracked files omitted)
 
 Recent commits:
 abc1234 feat: Add new API endpoint

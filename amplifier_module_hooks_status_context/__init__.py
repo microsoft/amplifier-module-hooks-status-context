@@ -32,6 +32,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - git_include_commits: Number of recent commits (default: 5)
             - git_include_branch: Include current branch (default: True)
             - git_include_main_branch: Detect main branch (default: True)
+            - git_status_include_untracked: Include untracked files (default: True)
+            - git_status_max_untracked: Max untracked files to show (default: 20, 0=unlimited)
+            - git_status_max_lines: Hard limit on total status lines (default: None)
             - include_datetime: Enable datetime injection (default: True)
             - datetime_include_timezone: Include timezone name (default: False)
             - include_session: Enable session ID injection (default: True)
@@ -73,6 +76,13 @@ class StatusContextHook:
         self.git_include_branch = config.get("git_include_branch", True)
         self.git_include_main_branch = config.get("git_include_main_branch", True)
 
+        # Git status truncation options
+        self.git_status_include_untracked = config.get(
+            "git_status_include_untracked", True
+        )
+        self.git_status_max_untracked = config.get("git_status_max_untracked", 20)
+        self.git_status_max_lines = config.get("git_status_max_lines", None)
+
         # Datetime options
         self.include_datetime = config.get("include_datetime", True)
         self.datetime_include_timezone = config.get("datetime_include_timezone", False)
@@ -86,7 +96,10 @@ class StatusContextHook:
     def register(self, hooks):
         """Register this hook for provider:request events (fires right before LLM call)."""
         hooks.register(
-            "provider:request", self.on_provider_request, priority=self.priority, name="hooks-status-context"
+            "provider:request",
+            self.on_provider_request,
+            priority=self.priority,
+            name="hooks-status-context",
         )
 
     async def on_provider_request(self, event: str, data: dict[str, Any]) -> HookResult:
@@ -115,7 +128,7 @@ class StatusContextHook:
 
         context_content = "\n\n".join(context_parts)
         behavioral_note = "\n\nThis context is for your reference only. DO NOT mention this status information to the user unless directly relevant to their question. Process silently and continue your work."
-        context_injection = f"<system-reminder source=\"hooks-status-context\">\n{context_content}{behavioral_note}\n</system-reminder>"
+        context_injection = f'<system-reminder source="hooks-status-context">\n{context_content}{behavioral_note}\n</system-reminder>'
 
         return HookResult(
             action="inject_context",
@@ -183,13 +196,15 @@ class StatusContextHook:
                 else:
                     env_lines.append("Is sub-session: No")
 
-            env_lines.extend([
-                f"Is directory a git repo: {'Yes' if is_git_repo else 'No'}",
-                f"Platform: {platform_name}",
-                f"OS Version: {os_version}",
-                f"Today's date: {date_str}",
-                "</env>",
-            ])
+            env_lines.extend(
+                [
+                    f"Is directory a git repo: {'Yes' if is_git_repo else 'No'}",
+                    f"Platform: {platform_name}",
+                    f"OS Version: {os_version}",
+                    f"Today's date: {date_str}",
+                    "</env>",
+                ]
+            )
 
             formatted = "\n".join(env_lines)
 
@@ -244,18 +259,22 @@ class StatusContextHook:
                 for main_branch in ["main", "master"]:
                     result = self._run_git(["rev-parse", "--verify", main_branch])
                     if result is not None:
-                        parts.append(f"\nMain branch (you will usually use this for PRs): {main_branch}")
+                        parts.append(
+                            f"\nMain branch (you will usually use this for PRs): {main_branch}"
+                        )
                         break
 
             # Working directory status
             if self.git_include_status:
-                status = self._run_git(["status", "--short"])
+                status = self._gather_git_status()
                 if status:
                     parts.append(f"\nStatus:\n{status}")
 
             # Recent commits
             if self.git_include_commits and self.git_include_commits > 0:
-                log = self._run_git(["log", "--oneline", f"-{self.git_include_commits}"])
+                log = self._run_git(
+                    ["log", "--oneline", f"-{self.git_include_commits}"]
+                )
                 if log:
                     parts.append(f"\nRecent commits:\n{log}")
 
@@ -264,6 +283,66 @@ class StatusContextHook:
         except Exception as e:
             logger.warning(f"Failed to gather git context: {e}")
             return None
+
+    def _gather_git_status(self) -> str | None:
+        """
+        Get git status with smart truncation.
+
+        Separates tracked changes from untracked files and applies limits to prevent
+        token bloat from large numbers of untracked files (e.g., node_modules/).
+
+        Returns:
+            Formatted git status output with truncation applied, or None if no changes
+        """
+        # Get raw git status
+        raw_status = self._run_git(["status", "--short"])
+        if not raw_status:
+            return "Working directory clean"
+
+        # Parse lines and separate tracked from untracked
+        lines = raw_status.splitlines()
+        tracked_lines = []
+        untracked_lines = []
+
+        for line in lines:
+            if line.startswith("??"):
+                untracked_lines.append(line)
+            else:
+                tracked_lines.append(line)
+
+        # Apply hard limit first if configured (limits total output regardless of type)
+        if self.git_status_max_lines is not None and self.git_status_max_lines > 0:
+            total_lines = tracked_lines + untracked_lines
+            if len(total_lines) > self.git_status_max_lines:
+                omitted = len(total_lines) - self.git_status_max_lines
+                result_lines = total_lines[: self.git_status_max_lines]
+                result_lines.append(f"... ({omitted} more files omitted)")
+                return "\n".join(result_lines)
+            return "\n".join(total_lines)
+
+        # Build output: always show all tracked changes
+        result_lines = tracked_lines.copy()
+
+        # Handle untracked files based on configuration
+        if not self.git_status_include_untracked:
+            # Don't include untracked files at all
+            if untracked_lines:
+                result_lines.append(
+                    f"... ({len(untracked_lines)} untracked files omitted)"
+                )
+        elif self.git_status_max_untracked == 0:
+            # Unlimited untracked files (old behavior)
+            result_lines.extend(untracked_lines)
+        else:
+            # Limit untracked files to max_untracked
+            if len(untracked_lines) <= self.git_status_max_untracked:
+                result_lines.extend(untracked_lines)
+            else:
+                result_lines.extend(untracked_lines[: self.git_status_max_untracked])
+                omitted = len(untracked_lines) - self.git_status_max_untracked
+                result_lines.append(f"... ({omitted} more untracked files omitted)")
+
+        return "\n".join(result_lines) if result_lines else "Working directory clean"
 
     def _run_git(self, args: list[str], timeout: float = 1.0) -> str | None:
         """Run a git command and return output."""
