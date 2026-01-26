@@ -96,6 +96,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         Optional cleanup function
     """
     config = config or {}
+
+    # If working_dir not explicitly set in config, use session.working_dir capability
+    # This enables server deployments where Path.cwd() returns the wrong directory
+    if "working_dir" not in config:
+        working_dir = coordinator.get_capability("session.working_dir")
+        if working_dir:
+            config = {**config, "working_dir": working_dir}
+
     hook = StatusContextHook(coordinator, config)
     hook.register(coordinator.hooks)
     logger.info("Mounted hooks-status-context")
