@@ -9,7 +9,7 @@ hooks:
   - module: hooks-status-context
     source: git+https://github.com/microsoft/amplifier-module-hooks-status-context@main
     config:
-      working_dir: "."                 # Working directory for operations (default: ".")
+      working_dir: "."                 # Working directory (defaults to session.working_dir capability)
       include_git: true                # Enable git status (default: true)
       git_include_status: true         # Show working dir status (default: true)
       git_include_commits: 5           # Recent commits count (default: 5, 0=disable)

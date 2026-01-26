@@ -73,6 +73,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         coordinator: Module coordinator
         config: Optional configuration
             - working_dir: Working directory for operations (default: ".")
+              If not set, falls back to session.working_dir capability.
             - include_git: Enable git status injection (default: True)
             - git_include_status: Include working directory status (default: True)
             - git_include_commits: Number of recent commits (default: 5)
