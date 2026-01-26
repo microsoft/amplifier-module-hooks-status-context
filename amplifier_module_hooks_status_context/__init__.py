@@ -73,6 +73,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         coordinator: Module coordinator
         config: Optional configuration
             - working_dir: Working directory for operations (default: ".")
+              If not set, falls back to session.working_dir capability.
             - include_git: Enable git status injection (default: True)
             - git_include_status: Include working directory status (default: True)
             - git_include_commits: Number of recent commits (default: 5)
@@ -96,6 +97,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         Optional cleanup function
     """
     config = config or {}
+
+    # If working_dir not explicitly set in config, use session.working_dir capability
+    # This enables server deployments where Path.cwd() returns the wrong directory
+    if "working_dir" not in config:
+        working_dir = coordinator.get_capability("session.working_dir")
+        if working_dir:
+            config = {**config, "working_dir": working_dir}
+
     hook = StatusContextHook(coordinator, config)
     hook.register(coordinator.hooks)
     logger.info("Mounted hooks-status-context")
