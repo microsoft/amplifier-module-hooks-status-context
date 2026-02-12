@@ -214,9 +214,10 @@ class StatusContextHook:
         return HookResult(
             action="inject_context",
             context_injection=context_injection,
-            context_injection_role="user",  # User role more visible than system
+            context_injection_role="user",  # User role ensures visibility across all providers
             ephemeral=True,  # Temporary injection, not stored in context
             suppress_output=True,  # Don't show verbose status to user
+            append_to_last_tool_result=True,  # Merge into last message to prevent consecutive user messages
         )
 
     def _gather_env_info(self) -> dict[str, Any]:
