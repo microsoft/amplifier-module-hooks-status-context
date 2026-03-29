@@ -545,7 +545,9 @@ class TestTierBasedFiltering:
                     filtered_found = True
                     assert "3" in line  # 3 untracked tier1 files
                     break
-            assert filtered_found, "Filtered message not found for tier1 untracked files"
+            assert filtered_found, (
+                "Filtered message not found for tier1 untracked files"
+            )
 
     def test_tier2_limited_display(self, hook_with_filtering):
         """Lockfiles and IDE configs limited to 10."""
@@ -636,10 +638,14 @@ class TestTierBasedFiltering:
 
             # Tier1 files should be filtered
             assert "?? node_modules/deep/nested/file.js" not in status_lines
-            assert "?? .venv/lib/python3.9/site-packages/pkg/module.py" not in status_lines
+            assert (
+                "?? .venv/lib/python3.9/site-packages/pkg/module.py" not in status_lines
+            )
 
             # Should have filtered/warning messages
-            assert any("[Filtered:" in line or "[WARNING:" in line for line in status_lines)
+            assert any(
+                "[Filtered:" in line or "[WARNING:" in line for line in status_lines
+            )
 
     def test_pattern_matching_glob_patterns(self, hook_with_filtering):
         """Test *.pyc style patterns."""
@@ -691,7 +697,13 @@ class TestTierBasedFiltering:
         tier3_untracked = [
             "?? test.txt",
         ]
-        git_output = "\n".join(tier1_untracked + tier1_tracked + tier2_files + tier3_tracked + tier3_untracked)
+        git_output = "\n".join(
+            tier1_untracked
+            + tier1_tracked
+            + tier2_files
+            + tier3_tracked
+            + tier3_untracked
+        )
 
         with patch.object(hook_with_filtering, "_run_git", return_value=git_output):
             status = hook_with_filtering._gather_git_status()
@@ -744,7 +756,10 @@ class TestTierBasedFiltering:
             assert any("and 2 more" in line for line in status_lines)
 
             # Should have suggestion
-            assert any("[Suggestion: These directories should not be tracked]" in line for line in status_lines)
+            assert any(
+                "[Suggestion: These directories should not be tracked]" in line
+                for line in status_lines
+            )
 
     def test_filtering_disabled(self, hook_without_filtering):
         """When path filtering disabled, all shown (subject to hard limit)."""
@@ -857,10 +872,14 @@ class TestTierBasedFiltering:
             status_lines = status.splitlines()
 
             # Should have WARNING for tracked
-            assert any("[WARNING:" in line and "1 tracked" in line for line in status_lines)
+            assert any(
+                "[WARNING:" in line and "1 tracked" in line for line in status_lines
+            )
 
             # Should have Filtered message for untracked
-            assert any("[Filtered:" in line and "3 untracked" in line for line in status_lines)
+            assert any(
+                "[Filtered:" in line and "3 untracked" in line for line in status_lines
+            )
 
             # Should show example of tracked tier1 file
             assert any("build/output.js" in line for line in status_lines)
@@ -923,3 +942,88 @@ class TestTierBasedFiltering:
                     assert "10" in line  # 10 untracked files omitted (30 - 20)
                     break
             assert summary_found, "Untracked files omitted message not found"
+
+
+class TestToolContinuationSkip:
+    """Test that status context is NOT injected on tool-continuation turns.
+
+    The hook fires on every provider:request event, but tool-continuation turns
+    (iteration > 1) don't need fresh status context. Re-injecting it creates
+    phantom user-role messages that can cause non-sequitur model responses.
+
+    See: https://github.com/microsoft/amplifier-module-hooks-status-context/pull/XX
+    """
+
+    @pytest.fixture
+    def mock_coordinator(self):
+        """Create a mock coordinator for testing."""
+        coordinator = Mock()
+        coordinator.session_id = "test-session-id"
+        coordinator.parent_id = None
+        return coordinator
+
+    @pytest.fixture
+    def hook(self, mock_coordinator):
+        """Create a hook with default configuration."""
+        config = {
+            "working_dir": ".",
+            "include_git": True,
+            "include_datetime": True,
+            "include_session": True,
+        }
+        return StatusContextHook(mock_coordinator, config)
+
+    @pytest.mark.asyncio
+    async def test_first_iteration_injects_context(self, hook):
+        """Iteration 1 (user-prompt turn) should inject status context."""
+        with patch.object(
+            hook,
+            "_gather_env_info",
+            return_value={
+                "is_git_repo": False,
+                "formatted": "mock env info",
+            },
+        ):
+            result = await hook.on_provider_request(
+                "provider:request", {"provider": "anthropic", "iteration": 1}
+            )
+            assert result.action == "inject_context"
+            assert result.context_injection is not None
+            assert "system-reminder" in result.context_injection
+
+    @pytest.mark.asyncio
+    async def test_second_iteration_skips_injection(self, hook):
+        """Iteration 2 (tool-continuation) should return no-op HookResult."""
+        result = await hook.on_provider_request(
+            "provider:request", {"provider": "anthropic", "iteration": 2}
+        )
+        # Default HookResult has action='continue' (no-op) and no injection
+        assert result.action == "continue"
+        assert result.context_injection is None
+
+    @pytest.mark.asyncio
+    async def test_high_iteration_skips_injection(self, hook):
+        """Any iteration > 1 should skip injection."""
+        for iteration in [3, 5, 10, 50]:
+            result = await hook.on_provider_request(
+                "provider:request", {"provider": "anthropic", "iteration": iteration}
+            )
+            assert result.context_injection is None, (
+                f"Iteration {iteration} should not inject context"
+            )
+
+    @pytest.mark.asyncio
+    async def test_missing_iteration_defaults_to_inject(self, hook):
+        """If iteration is missing from event data, default to injecting (safe fallback)."""
+        with patch.object(
+            hook,
+            "_gather_env_info",
+            return_value={
+                "is_git_repo": False,
+                "formatted": "mock env info",
+            },
+        ):
+            result = await hook.on_provider_request(
+                "provider:request", {"provider": "anthropic"}
+            )
+            assert result.action == "inject_context"
