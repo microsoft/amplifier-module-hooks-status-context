@@ -187,13 +187,26 @@ class StatusContextHook:
         """
         Inject status context before provider request (right before LLM call).
 
+        Only injects on the first iteration (user-prompt turn). Tool-continuation
+        turns (iteration > 1) don't need fresh status context - the git status is
+        a snapshot that doesn't change mid-turn, and re-injecting it as a user-role
+        message on tool-continuation turns can cause the model to treat the injected
+        reminder as a new user message requiring a conversational response.
+
         Args:
             event: Event name (provider:request)
-            data: Event data
+            data: Event data containing 'iteration' (1 = user prompt, >1 = tool continuation)
 
         Returns:
-            HookResult with context injection
+            HookResult with context injection (first iteration) or no-op (subsequent)
         """
+        # Skip injection on tool-continuation turns (iteration > 1).
+        # Status context is a snapshot - re-injecting it adds no value and creates
+        # phantom user-role messages that can confuse the model into generating
+        # non-sequitur responses after completing tool work.
+        if data.get("iteration", 1) > 1:
+            return HookResult()
+
         # Gather environment info (always shown)
         env_info = self._gather_env_info()
 
