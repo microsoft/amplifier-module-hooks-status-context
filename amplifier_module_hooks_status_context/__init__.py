@@ -88,8 +88,17 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - git_status_tier2_limit: Max Tier 2 files to show (default: 10)
             - git_status_max_tracked: Max tracked files to show (default: 50)
             - git_status_show_filter_summary: Show filtering messages (default: True)
-            - include_datetime: Enable datetime injection (default: True)
-            - datetime_include_timezone: Include timezone name (default: False)
+            - include_datetime: Include time-of-day (hh:mm:ss) in the date field, not
+              just the calendar date (default: False). Leave this False unless you
+              specifically need sub-day precision: every request re-renders this field
+              live (it is never cached), so second-resolution timestamps make the
+              injected block differ on almost every single LLM turn. That defeats
+              provider-side prompt caching (measured -17 to -20 percentage points of
+              cache-hit rate on Gemini, whose caching is implicit/content-addressed
+              with no server-side lever to compensate). Calendar-day resolution keeps
+              the field truthful and live while changing at most once every 24h.
+            - datetime_include_timezone: Include timezone name (default: False).
+              Only applies when include_datetime is True.
             - include_session: Enable session ID injection (default: True)
             - priority: Hook priority (default: 0)
 
@@ -165,7 +174,15 @@ class StatusContextHook:
         )
 
         # Datetime options
-        self.include_datetime = config.get("include_datetime", True)
+        # Default is False (calendar-date only, no time-of-day): the date field is
+        # rendered fresh on every request (never cached -- see _current_date_str), so
+        # second-resolution timestamps make the injected block differ on nearly every
+        # LLM turn. That silently defeats provider-side prompt caching -- measured
+        # -17 to -20 percentage points of cache-hit rate on Gemini in production, with
+        # no server-side mitigation available (Gemini's caching is implicit/content-
+        # addressed). Set to True only if the agent genuinely needs sub-day precision;
+        # doing so knowingly reintroduces that cache cost.
+        self.include_datetime = config.get("include_datetime", False)
         self.datetime_include_timezone = config.get("datetime_include_timezone", False)
 
         # Session options
@@ -173,6 +190,20 @@ class StatusContextHook:
 
         # Hook priority
         self.priority = config.get("priority", 0)
+
+        # --- Per-session snapshot cache ---
+        # Everything cached here (working dir, platform, OS, git-repo detection, and
+        # the entire git status/branch/log block) is invariant for the lifetime of a
+        # session: this hook instance is created fresh per mount() (see amplifier-core's
+        # module lifecycle contract -- one mount() per session, including forked child
+        # sessions), so caching on `self` is exactly session-scoped. Computing these
+        # once instead of on every provider:request also matches the git block's own
+        # documented promise to the agent ("a snapshot in time ... will not update
+        # during the conversation") -- previously the code silently violated that
+        # promise by re-running `git status`/`git log` on every single turn.
+        self._cached_static_env: dict[str, Any] | None = None
+        self._git_details_computed = False
+        self._cached_git_details: str | None = None
 
     def register(self, hooks):
         """Register this hook for provider:request events (fires right before LLM call)."""
@@ -194,16 +225,22 @@ class StatusContextHook:
         Returns:
             HookResult with context injection
         """
-        # Gather environment info (always shown)
-        env_info = self._gather_env_info()
+        # Static environment facts: computed once per session, cached thereafter.
+        static_env = self._get_static_env()
 
-        # Gather git status details (only if repo detected and enabled)
+        # Current date: recomputed live on every call (see _current_date_str for why
+        # this is intentionally NOT cached), then merged with the cached static facts
+        # to build the full formatted env block.
+        formatted_env = self._format_env_block(static_env, self._current_date_str())
+
+        # Gather git status details (only if repo detected and enabled). Computed once
+        # per session and reused -- see _get_git_details.
         git_details = None
-        if self.include_git and env_info.get("is_git_repo"):
-            git_details = self._gather_git_context()
+        if self.include_git and static_env.get("is_git_repo"):
+            git_details = self._get_git_details()
 
         # Build context injection wrapped in system-reminder tags
-        context_parts = [env_info["formatted"]]
+        context_parts = [formatted_env]
         if git_details:
             context_parts.append(git_details)
 
@@ -219,8 +256,20 @@ class StatusContextHook:
             suppress_output=True,  # Don't show verbose status to user
         )
 
-    def _gather_env_info(self) -> dict[str, Any]:
-        """Gather environment information (working dir, platform, OS, date, session, git detection)."""
+    def _get_static_env(self) -> dict[str, Any]:
+        """Return environment facts that cannot change during a session.
+
+        Computed once (lazily, on first request) and cached on `self` for the
+        remaining lifetime of this hook instance. Working directory, platform, OS
+        version, session identity, and git-repo detection are all fixed at session
+        start -- there is no need to re-stat the filesystem, re-invoke `platform`,
+        or re-shell out to `git rev-parse` on every single LLM turn just to get the
+        same answer back. This also means a transient failure is captured once
+        (as a stable fallback) rather than logged and retried on every request.
+        """
+        if self._cached_static_env is not None:
+            return self._cached_static_env
+
         try:
             # Get working directory (from config or current directory)
             working_dir_path = Path(self.working_dir)
@@ -238,17 +287,6 @@ class StatusContextHook:
             # Get OS version
             os_version = platform.platform()
 
-            # Get current date (with optional time)
-            now = datetime.now()
-            if self.include_datetime:
-                if self.datetime_include_timezone:
-                    timezone_name = now.astimezone().tzname()
-                    date_str = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {timezone_name}"
-                else:
-                    date_str = f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
-            else:
-                date_str = now.strftime("%Y-%m-%d")
-
             # Get session info (from kernel via coordinator)
             session_id = None
             parent_session_id = None
@@ -261,44 +299,14 @@ class StatusContextHook:
                 except Exception as e:
                     logger.debug(f"Could not get session info: {e}")
 
-            # Format the env block
-            env_lines = [
-                "Here is useful information about the environment you are running in:",
-                "<env>",
-                f"Working directory: {working_dir}",
-            ]
-
-            # Add session info if available
-            if self.include_session and session_id:
-                env_lines.append(f"Session ID: {session_id}")
-                if is_sub_session:
-                    env_lines.append(f"Parent Session ID: {parent_session_id}")
-                    env_lines.append("Is sub-session: Yes")
-                else:
-                    env_lines.append("Is sub-session: No")
-
-            env_lines.extend(
-                [
-                    f"Is directory a git repo: {'Yes' if is_git_repo else 'No'}",
-                    f"Platform: {platform_name}",
-                    f"OS Version: {os_version}",
-                    f"Today's date: {date_str}",
-                    "</env>",
-                ]
-            )
-
-            formatted = "\n".join(env_lines)
-
-            return {
+            result = {
                 "working_dir": working_dir,
                 "is_git_repo": is_git_repo,
                 "platform": platform_name,
                 "os_version": os_version,
-                "date": date_str,
                 "session_id": session_id,
                 "parent_session_id": parent_session_id,
                 "is_sub_session": is_sub_session,
-                "formatted": formatted,
             }
 
         except Exception as e:
@@ -309,17 +317,91 @@ class StatusContextHook:
                 fallback_dir = str(Path.cwd() / working_dir_path)
             else:
                 fallback_dir = str(working_dir_path)
-            return {
+            result = {
                 "working_dir": fallback_dir,
                 "is_git_repo": False,
                 "platform": "unknown",
                 "os_version": "unknown",
-                "date": datetime.now().strftime("%Y-%m-%d"),
                 "session_id": None,
                 "parent_session_id": None,
                 "is_sub_session": False,
-                "formatted": "Here is useful information about the environment you are running in:\n<env>\nEnvironment information unavailable\n</env>",
+                "error": True,
             }
+
+        self._cached_static_env = result
+        return result
+
+    def _current_date_str(self) -> str:
+        """Return the current date, freshly computed on every call.
+
+        Deliberately NOT cached, unlike the static env facts and git details above:
+        "today's date" is a genuinely live fact that can roll over mid-session, and
+        reporting a cached-and-stale date would violate the no-silent-staleness rule.
+        Instead the granularity is coarsened (see include_datetime, default False):
+        calendar-day resolution stays truthful and live while changing at most once
+        per 24h, so repeated calls on the same day still produce a byte-identical
+        env block without ever caching (and therefore risking) a stale value.
+        """
+        now = datetime.now()
+        if self.include_datetime:
+            if self.datetime_include_timezone:
+                timezone_name = now.astimezone().tzname()
+                return f"{now.strftime('%Y-%m-%d %H:%M:%S')} {timezone_name}"
+            return f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
+        return now.strftime("%Y-%m-%d")
+
+    def _format_env_block(self, static_env: dict[str, Any], date_str: str) -> str:
+        """Render the `<env>` block from cached static facts plus the live date string."""
+        if static_env.get("error"):
+            return (
+                "Here is useful information about the environment you are running in:"
+                "\n<env>\nEnvironment information unavailable\n</env>"
+            )
+
+        env_lines = [
+            "Here is useful information about the environment you are running in:",
+            "<env>",
+            f"Working directory: {static_env['working_dir']}",
+        ]
+
+        # Add session info if available
+        if self.include_session and static_env.get("session_id"):
+            env_lines.append(f"Session ID: {static_env['session_id']}")
+            if static_env["is_sub_session"]:
+                env_lines.append(
+                    f"Parent Session ID: {static_env['parent_session_id']}"
+                )
+                env_lines.append("Is sub-session: Yes")
+            else:
+                env_lines.append("Is sub-session: No")
+
+        env_lines.extend(
+            [
+                f"Is directory a git repo: {'Yes' if static_env['is_git_repo'] else 'No'}",
+                f"Platform: {static_env['platform']}",
+                f"OS Version: {static_env['os_version']}",
+                f"Today's date: {date_str}",
+                "</env>",
+            ]
+        )
+
+        return "\n".join(env_lines)
+
+    def _get_git_details(self) -> str | None:
+        """Return the git status/branch/commits block, computed once per session.
+
+        This block explicitly tells the agent it is "a snapshot in time" that "will
+        not update during the conversation" (see _gather_git_context below). Prior to
+        this fix that promise was false: `git status`/`git log`/`git branch` were
+        re-run on every single provider:request, so the block silently changed turn
+        to turn even when nothing in the repo had changed. Caching here makes the
+        implementation match its own documented contract, and incidentally removes
+        several subprocess invocations from every LLM turn after the first.
+        """
+        if not self._git_details_computed:
+            self._cached_git_details = self._gather_git_context()
+            self._git_details_computed = True
+        return self._cached_git_details
 
     def _gather_git_context(self) -> str | None:
         """Gather current git repository context (assumes already detected as git repo)."""

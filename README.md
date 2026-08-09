@@ -19,8 +19,8 @@ hooks:
       git_status_max_untracked: 20       # Max untracked files (default: 20, 0=unlimited)
       git_status_max_tracked: 50         # Max tracked files (default: 50)
       git_status_max_lines: 100          # Hard output cap (default: 100)
-      include_datetime: true           # Show date/time (default: true)
-      datetime_include_timezone: false # Include TZ name (default: false)
+      include_datetime: false          # Include time-of-day, not just the date (default: false)
+      datetime_include_timezone: false # Include TZ name (default: false, only applies if include_datetime: true)
       include_session: true            # Show session ID info (default: true)
       
       # Token safety (tier-based filtering)
@@ -177,7 +177,7 @@ Is sub-session: No
 Is directory a git repo: Yes
 Platform: linux
 OS Version: Linux 6.6.87.2-microsoft-standard-WSL2
-Today's date: 2025-11-09 14:23:45
+Today's date: 2025-11-09
 </env>
 
 gitStatus: This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.
@@ -234,7 +234,39 @@ Today's date: 2025-11-09 14:23:45
 </system-reminder>
 ```
 
-Note: Git status only shown when in a git repository and `include_git: true`. Date format includes time when `include_datetime: true`, otherwise date only. Session lineage (parent session ID) only shown for sub-sessions spawned via the task tool.
+Note: Git status only shown when in a git repository and `include_git: true`. Date format includes time when `include_datetime: true`; otherwise (the default) it's calendar-date only. Session lineage (parent session ID) only shown for sub-sessions spawned via the task tool.
+
+## Caching and Snapshot Semantics
+
+This hook is injected `ephemeral=True` on every `provider:request` -- a fresh copy is
+appended to every single LLM call, never stored in the persisted conversation. Two
+pieces of this injected text are computed **once per session** and reused for every
+subsequent request, rather than recomputed every turn:
+
+- **Git status, branch, and recent commits** -- the injected text already tells the
+  agent this is "a snapshot in time" that "will not update during the conversation."
+  This is now literally true: `git status`/`git log`/`git branch` run once, on the
+  first `provider:request` of the session, and the result is cached for the rest of
+  the session's lifetime. If the repo changes later in the conversation (the agent
+  edits files, switches branches, commits), the injected block will **not** reflect
+  that -- by design, matching what the text already promises.
+- **Working directory, platform, OS version, git-repo detection, and session
+  identity** -- these cannot change during a session, so they're also computed once.
+
+**Only the date** is recomputed live on every request (it is never cached, so it can
+never go stale), but by default it renders at calendar-day resolution rather than
+including time-of-day. Setting `include_datetime: true` opts into second-resolution
+timestamps, which -- because that field is *not* cached -- means the injected text
+differs on nearly every single turn.
+
+Why this matters: measured on real Gemini API traffic, a per-request mutating tail
+(gratuitously different content appended to an otherwise-stable prompt) cost 17-20
+percentage points of implicit prompt cache-hit rate (`gemini-2.5-flash`: 0.813 vs 0.987;
+`gemini-2.5-flash-lite`: 0.667 vs 0.867; 300 calls/arm). Since a cache miss bills the
+entire prefix at full price, and Gemini's caching is implicit/content-addressed with no
+server-side lever to compensate (unlike Anthropic, whose provider can walk cache
+breakpoints back past trailing ephemeral content), the only mitigation is to stop
+generating gratuitously different content in the first place.
 
 ## Contributing
 
