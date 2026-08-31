@@ -6,6 +6,7 @@ Injects current git status and datetime into agent context before each prompt.
 # Amplifier module metadata
 __amplifier_module_type__ = "hook"
 
+import hashlib
 import logging
 import platform
 import subprocess
@@ -17,6 +18,28 @@ from amplifier_core import HookResult
 from amplifier_core import ModuleCoordinator
 
 logger = logging.getLogger(__name__)
+
+# Placement of the static block (system-reminder redesign, W2):
+#   "prefix"  (default) -- wraps the context module's system-prompt factory
+#       (the surface amplifier-foundation _prepared.py registers via
+#       context.set_system_prompt_factory; context-simple calls it on EVERY
+#       get_messages_for_request) so the static portion (env facts minus
+#       date, plus the git snapshot) rides the provider-cached system block
+#       instead of being re-sent as fresh input tokens every request. Only
+#       the genuinely live "Today's date" line still rides the late,
+#       per-turn injection. Sessions without a factory surface fall back to
+#       "inject" with a one-time WARNING.
+#   "inject" -- the full block (static + date), injected on every
+#       provider:request -- byte-identical to `e3cbf7b` behavior. Explicit,
+#       fully supported rollback lever.
+VALID_PLACEMENTS = ("prefix", "inject")
+
+# The source-attributed marker this module's own prefix block always opens
+# with (see _render_static_block). Used as a CONTENT signal in
+# _ensure_prefix_placement (rr wave 20260831, D1 cache-regression fix) --
+# see that method's docstring for why identity alone is not a safe check
+# once more than one hook wraps the same system-prompt-factory slot.
+_PREFIX_MARKER = '<system-reminder source="hooks-status-context">'
 
 
 # Tier 1: Always ignore (DoS prevention) - Even if tracked, these should never bloat context
@@ -191,6 +214,28 @@ class StatusContextHook:
         # Hook priority
         self.priority = config.get("priority", 0)
 
+        # Placement of the static block (system-reminder redesign, W2).
+        self.placement = config.get("placement", "prefix")
+        if self.placement not in VALID_PLACEMENTS:
+            raise ValueError(
+                f"Invalid placement={self.placement!r}. "
+                f"Valid values: {', '.join(VALID_PLACEMENTS)}."
+            )
+        # Prefix-placement state: the wrapped factory we registered (identity
+        # check for re-wrap detection), the fingerprint hash of the last
+        # static render, the cached rendered static block, and a one-time
+        # fallback-warning flag.
+        self._prefix_factory: Any = None
+        self._prefix_static_hash: str | None = None
+        self._prefix_rendered: str = ""
+        self._prefix_unavailable_logged = False
+        # rr wave 20260831 (D1 cache-regression fix): the last `current`
+        # factory object we CONTENT-VERIFIED already carries our own marker
+        # (see _ensure_prefix_placement). Avoids re-rendering the whole
+        # chain on every request once verified once for a given factory
+        # object.
+        self._prefix_verified_factory: Any = None
+
         # --- Per-session snapshot cache ---
         # Everything cached here (working dir, platform, OS, git-repo detection, and
         # the entire git status/branch/log block) is invariant for the lifetime of a
@@ -218,6 +263,14 @@ class StatusContextHook:
         """
         Inject status context before provider request (right before LLM call).
 
+        Placement (system-reminder redesign, W2):
+          - "prefix" (default): the STATIC portion (env facts minus date,
+            plus the git snapshot) rides the system prompt via the wrapped
+            factory (see _ensure_prefix_placement); only the live "Today's
+            date" line still rides this per-request injection.
+          - "inject" (rollback): the full block (static + date) rides this
+            per-request injection every time, byte-identical to `e3cbf7b`.
+
         Args:
             event: Event name (provider:request)
             data: Event data
@@ -225,36 +278,205 @@ class StatusContextHook:
         Returns:
             HookResult with context injection
         """
-        # Static environment facts: computed once per session, cached thereafter.
-        static_env = self._get_static_env()
+        if self.placement == "prefix":
+            if await self._ensure_prefix_placement():
+                return HookResult(
+                    action="inject_context",
+                    context_injection=self._render_dynamic_block(),
+                    context_injection_role="user",
+                    ephemeral=True,
+                    suppress_output=True,
+                )
+            # Placement surface unavailable (no context module / no factory
+            # support). Warn once, then fall back to injecting the FULL
+            # block every request so the agent is never silently blinded to
+            # its static environment facts.
+            if not self._prefix_unavailable_logged:
+                logger.warning(
+                    "placement='prefix' (the default) but the context "
+                    "module offers no system-prompt factory surface "
+                    "(set_system_prompt_factory). Falling back to "
+                    "per-request injection of the full block -- the "
+                    "static env/git facts will not ride the stable cached "
+                    "prefix. Set placement='inject' to silence this "
+                    "warning."
+                )
+                self._prefix_unavailable_logged = True
 
-        # Current date: recomputed live on every call (see _current_date_str for why
-        # this is intentionally NOT cached), then merged with the cached static facts
-        # to build the full formatted env block.
+        return HookResult(
+            action="inject_context",
+            context_injection=self._render_full_block(),
+            context_injection_role="user",  # User role more visible than system
+            ephemeral=True,  # Temporary injection, not stored in context
+            suppress_output=True,  # Don't show verbose status to user
+        )
+
+    def _render_full_block(self) -> str:
+        """Render the FULL block (static env/git facts + live date),
+        wrapped in the system-reminder envelope -- byte-identical to
+        `e3cbf7b`'s single-block behavior. Used for `placement="inject"`
+        (the rollback lever) and as the fallback when the prefix-placement
+        surface is unavailable."""
+        static_env = self._get_static_env()
         formatted_env = self._format_env_block(static_env, self._current_date_str())
 
-        # Gather git status details (only if repo detected and enabled). Computed once
-        # per session and reused -- see _get_git_details.
         git_details = None
         if self.include_git and static_env.get("is_git_repo"):
             git_details = self._get_git_details()
 
-        # Build context injection wrapped in system-reminder tags
         context_parts = [formatted_env]
         if git_details:
             context_parts.append(git_details)
 
         context_content = "\n\n".join(context_parts)
         behavioral_note = "\n\nThis context is for your reference only. DO NOT mention this status information to the user unless directly relevant to their question. Process silently and continue your work."
-        context_injection = f'<system-reminder source="hooks-status-context">\n{context_content}{behavioral_note}\n</system-reminder>'
+        return f'<system-reminder source="hooks-status-context">\n{context_content}{behavioral_note}\n</system-reminder>'
 
-        return HookResult(
-            action="inject_context",
-            context_injection=context_injection,
-            context_injection_role="user",  # User role more visible than system
-            ephemeral=True,  # Temporary injection, not stored in context
-            suppress_output=True,  # Don't show verbose status to user
+    def _render_static_block(self) -> str:
+        """Render the STATIC portion only (env facts minus the `Today's
+        date` line, plus the git snapshot), wrapped in the system-reminder
+        envelope, for placement in the system prompt (system-reminder
+        redesign, W2). Both inputs are session-cached and invariant for
+        the session, so this render is itself effectively constant --
+        safe to place in the stable, provider-cached system prefix. The
+        behavioral note lives here (stated once, in the system prompt)
+        rather than in the per-turn dynamic block."""
+        static_env = self._get_static_env()
+        env_block = self._format_env_block(static_env, "", include_date=False)
+
+        git_details = None
+        if self.include_git and static_env.get("is_git_repo"):
+            git_details = self._get_git_details()
+
+        parts = [env_block]
+        if git_details:
+            parts.append(git_details)
+
+        content = "\n\n".join(parts)
+        behavioral_note = "\n\nThis context is for your reference only. DO NOT mention this status information to the user unless directly relevant to their question. Process silently and continue your work."
+        return f'<system-reminder source="hooks-status-context">\n{content}{behavioral_note}\n</system-reminder>'
+
+    def _render_dynamic_block(self) -> str:
+        """Render ONLY the live `Today's date` line (system-reminder
+        redesign, W2) -- the one genuinely time-varying fact, wrapped in
+        the same source-attributed envelope. Rides the per-turn injection
+        in `placement="prefix"` mode, ~20 tokens instead of the full
+        env+git block."""
+        date_line = f"Today's date: {self._current_date_str()}"
+        return f'<system-reminder source="hooks-status-context">\n{date_line}\n</system-reminder>'
+
+    async def _ensure_prefix_placement(self) -> bool:
+        """Ensure the static block rides the system prompt (stable prefix).
+
+        Originally a near-verbatim port of tool-skills'
+        `_ensure_prefix_placement` (amplifier-bundle-skills
+        modules/tool-skills/hooks.py:232-290): defensive
+        coordinator.get("context") lookup, refuse to replace a static
+        system prompt (no factory registered), lazy wrap on first
+        provider:request.
+
+        rr wave 20260831 (D1 cache-regression fix): the ORIGINAL re-wrap
+        check here was pure object identity -- `current is self._prefix_factory`.
+        That is safe ONLY while this hook is the sole wrapper of the
+        system-prompt-factory slot (tool-skills' own production history).
+        Once a SECOND independent hook (e.g. routing-matrix) ALSO wraps the
+        same slot with the same pattern, identity breaks: every hook whose
+        own wrap is not the OUTERMOST one sees `current` change out from
+        under it on every subsequent request (because a PEER hook's wrap
+        moved the slot forward), concludes "not wrapped yet", and wraps
+        AGAIN around a chain that already contains its own prior
+        contribution. With N such hooks all doing this, the composed
+        system prompt gains N NEW copies of every hook's block on every
+        single request -- unbounded, per-request growth (confirmed on the
+        wire: rr-anth-01's system prompt grew ~21.7K chars/request, every
+        hook's block count incrementing 1 -> 2 -> 3 -> ... in lockstep with
+        the request index). This is what collapsed anthropic's prompt-cache
+        read share from ~90% to ~8% in the 20260831-rr validation wave.
+
+        The fix: keep the identity check as a fast path (nothing has
+        touched the slot since we last verified/wrapped it -> cheap,
+        no-op). When identity fails, do NOT assume "not yet wrapped" --
+        render the CURRENT chain once and check whether our own
+        source-attributed marker (_PREFIX_MARKER) is already present
+        somewhere in it. If so, our content already rides the system
+        prompt (just nested under a peer hook's OUTER wrap) and touching
+        the slot again would only duplicate it -- return True without
+        calling set_system_prompt_factory. Only wrap when our marker is
+        genuinely absent (first request ever, or the base was legitimately
+        reset to something with no memory of us). The verified factory
+        object is cached (_prefix_verified_factory) so this content check
+        runs at most once per distinct factory object, not every request.
+
+        Returns:
+            True when the static block is (now) riding the system prompt;
+            False when the surface is unavailable and the caller should
+            fall back to full-block per-request injection.
+        """
+        getter = getattr(self.coordinator, "get", None) if self.coordinator else None
+        context: Any = getter("context") if callable(getter) else None
+        if context is None or not hasattr(context, "set_system_prompt_factory"):
+            return False
+
+        current = getattr(context, "_system_prompt_factory", None)
+        if current is None:
+            # No factory registered (static-system-message session).
+            # Wrapping would DROP the static system prompt (factory takes
+            # precedence over stored system messages in context-simple),
+            # so refuse and let the caller fall back.
+            return False
+        if current is self._prefix_factory or current is self._prefix_verified_factory:
+            return (
+                True  # fast path -- nothing has touched the slot since we last checked
+            )
+
+        # Slow path: a peer hook has (re-)wrapped the slot since we last
+        # looked. Render once and check CONTENT, not identity -- see
+        # docstring above for why identity alone cannot tell "already
+        # present, just wrapped by someone else afterward" apart from
+        # "genuinely never wrapped".
+        current_text = await current()
+        if _PREFIX_MARKER in current_text:
+            self._prefix_verified_factory = current
+            return True
+
+        base_factory = current
+
+        async def _status_prefixed_factory() -> str:
+            base = await base_factory()
+            block = self._render_prefix_block()
+            return f"{base}\n\n{block}" if block else base
+
+        await context.set_system_prompt_factory(_status_prefixed_factory)
+        self._prefix_factory = _status_prefixed_factory
+        logger.info(
+            "Status-context static block placement: system-prompt prefix "
+            "(wrapped the registered system-prompt factory)"
         )
+        return True
+
+    def _render_prefix_block(self) -> str:
+        """Render the static block for prefix placement, cached by a
+        fingerprint hash of its own inputs.
+
+        Both inputs (`_get_static_env()`, `_get_git_details()`) are
+        already session-cached and, in practice, never change mid-session
+        -- so this render happens once. Keeping the hash-gate discipline
+        anyway costs nothing and matches the "re-render on change, never
+        go stale" pattern used elsewhere (e.g. tool-skills' own prefix
+        placement).
+        """
+        static_env = self._get_static_env()
+        git_details = (
+            self._get_git_details()
+            if (self.include_git and static_env.get("is_git_repo"))
+            else None
+        )
+        fingerprint = repr((sorted(static_env.items()), git_details))
+        fp_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
+        if fp_hash != self._prefix_static_hash:
+            self._prefix_static_hash = fp_hash
+            self._prefix_rendered = self._render_static_block()
+        return self._prefix_rendered
 
     def _get_static_env(self) -> dict[str, Any]:
         """Return environment facts that cannot change during a session.
@@ -350,8 +572,21 @@ class StatusContextHook:
             return f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
         return now.strftime("%Y-%m-%d")
 
-    def _format_env_block(self, static_env: dict[str, Any], date_str: str) -> str:
-        """Render the `<env>` block from cached static facts plus the live date string."""
+    def _format_env_block(
+        self,
+        static_env: dict[str, Any],
+        date_str: str,
+        *,
+        include_date: bool = True,
+    ) -> str:
+        """Render the `<env>` block from cached static facts plus the live date string.
+
+        `include_date` (system-reminder redesign, W2): False for the
+        static-block render (`_render_static_block`), since the `Today's
+        date` line is the one genuinely live fact and rides the separate
+        dynamic injection instead. `date_str` is ignored entirely when
+        `include_date` is False.
+        """
         if static_env.get("error"):
             return (
                 "Here is useful information about the environment you are running in:"
@@ -380,10 +615,11 @@ class StatusContextHook:
                 f"Is directory a git repo: {'Yes' if static_env['is_git_repo'] else 'No'}",
                 f"Platform: {static_env['platform']}",
                 f"OS Version: {static_env['os_version']}",
-                f"Today's date: {date_str}",
-                "</env>",
             ]
         )
+        if include_date:
+            env_lines.append(f"Today's date: {date_str}")
+        env_lines.append("</env>")
 
         return "\n".join(env_lines)
 
